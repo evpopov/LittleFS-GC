@@ -283,6 +283,14 @@ struct lfs_config {
     // Set to -1 to disable inlined files.
     lfs_size_t inline_max;
 
+#ifdef LFS_PROACTIVE_GC
+    lfs_size_t gc_buffer_num_words;
+    uint32_t *gc_u32_buffer;
+    lfs_size_t gc_bitmap_size;
+    void *gc_used_bitmap;
+    void *gc_clean_bitmap;
+#endif
+
 #ifdef LFS_MULTIVERSION
     // On-disk version to use when writing in the form of 16-bit major version
     // + 16-bit minor version. This limiting metadata to what is supported by
@@ -466,6 +474,17 @@ typedef struct lfs {
 
 #ifdef LFS_MIGRATE
     struct lfs1 *lfs1;
+#endif
+
+#ifdef LFS_PROACTIVE_GC
+    struct lfs_gc {
+        uint8_t *clean_block_bitmap;
+        uint8_t *used_block_bitmap;
+        uint32_t *u32_buffer;
+		lfs_block_t block;
+		lfs_block_t blocks_checked;
+		uint8_t clean_map_initialized;
+    } gc;
 #endif
 } lfs_t;
 
@@ -760,6 +779,14 @@ int lfs_fs_mkconsistent(lfs_t *lfs);
 // Returns a negative error code on failure. Accomplishing nothing is not
 // an error.
 int lfs_fs_gc(lfs_t *lfs);
+#endif
+
+#ifndef LFS_READONLY
+	#ifdef LFS_PROACTIVE_GC
+		int lfs_gc_update_usage_map( lfs_t *lfs );
+		void lfs_gc_do_work(lfs_t * lfs);
+		int lfs_gc_is_fs_clean( lfs_t * lfs );
+	#endif
 #endif
 
 #ifndef LFS_READONLY

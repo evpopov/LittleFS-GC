@@ -25,6 +25,12 @@ enum {
     LFS_CMP_GT = 2,
 };
 
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+	void lfs_gc_init_( lfs_t *lfs );
+	static void lfs_gc_mark_block_as_used_( lfs_t * lfs, lfs_block_t block );
+#endif /* LFS_PROACTIVE_GC */
+#endif /* LFS_READONLY */
 
 /// Caching block device operations ///
 
@@ -184,6 +190,9 @@ static int lfs_bd_flush(lfs_t *lfs,
         if (err) {
             return err;
         }
+		#ifdef LFS_PROACTIVE_GC
+			lfs_gc_mark_block_as_used_( lfs, pcache->block );
+		#endif
 
         if (validate) {
             // check data on disk
@@ -274,6 +283,20 @@ static int lfs_bd_prog(lfs_t *lfs,
 #ifndef LFS_READONLY
 static int lfs_bd_erase(lfs_t *lfs, lfs_block_t block) {
     LFS_ASSERT(block < lfs->block_count);
+	#ifdef LFS_PROACTIVE_GC
+		// If the clean block map has been initialized, the block may not need erasing at all.
+		if ( lfs->gc.clean_map_initialized )
+		{
+			int32_t EBM_Index = block / 8;
+			int32_t EBM_Bit = block % 8;
+			if( (lfs->gc.clean_block_bitmap[EBM_Index] >> EBM_Bit) & 1)
+			{
+				// The block is already verified clean.
+				//LFS_GC_TRACE("Erase Block 0x%08X, Already Clean !!!", block);
+				return LFS_ERR_OK;
+			}
+		}
+	#endif
     int err = lfs->cfg->erase(lfs->cfg, block);
     LFS_ASSERT(err <= 0);
     return err;
@@ -1974,6 +1997,7 @@ static int lfs_dir_compact(lfs_t *lfs,
 #endif
 
     if (tired && lfs_pair_cmp(dir->pair, (const lfs_block_t[2]){0, 1}) != 0) {
+				//LFS_GC_TRACE("********** RELOCATE 1 **********");
         // we're writing too much, time to relocate
         goto relocate;
     }
@@ -2198,6 +2222,7 @@ static int lfs_dir_splittingcompact(lfs_t *lfs, lfs_mdir_t *dir,
 
     if (lfs_dir_needsrelocation(lfs, dir)
             && lfs_pair_cmp(dir->pair, (const lfs_block_t[2]){0, 1}) == 0) {
+				//LFS_GC_TRACE("********** RELOCATE 2 **********");
         // oh no! we're writing too much to the superblock,
         // should we expand?
         lfs_ssize_t size = lfs_fs_size_(lfs);
@@ -3257,6 +3282,7 @@ static int lfs_file_close_(lfs_t *lfs, lfs_file_t *file) {
     // clean up memory
     if (!file->cfg->buffer) {
         lfs_free(file->cache.buffer);
+        file->cache.buffer = NULL;
     }
 
     return err;
@@ -4304,6 +4330,47 @@ static int lfs_init(lfs_t *lfs, const struct lfs_config *cfg) {
         }
     }
 
+#ifdef LFS_PROACTIVE_GC
+    lfs->gc.clean_map_initialized = false;
+
+    LFS_ASSERT(lfs->cfg->gc_buffer_num_words >= 1);
+    if (lfs->cfg->gc_u32_buffer) {
+	    lfs->gc.u32_buffer = lfs->cfg->gc_u32_buffer;
+	} else {
+        lfs->gc.u32_buffer = lfs_malloc(lfs->cfg->gc_buffer_num_words * sizeof(uint32_t));
+        if (!lfs->gc.u32_buffer) {
+            err = LFS_ERR_NOMEM;
+            goto cleanup;
+        }
+    }
+
+    lfs_size_t bitmap_size = (lfs->cfg->block_count + 7) / 8;
+    // If the user is providing us with pre-allocated buffers, they must be the correct size.
+    if ( lfs->cfg->gc_used_bitmap || lfs->cfg->gc_clean_bitmap) {
+        LFS_ASSERT(lfs->cfg->gc_bitmap_size == bitmap_size);
+        LFS_ASSERT( lfs->cfg->gc_used_bitmap != NULL );
+        LFS_ASSERT( lfs->cfg->gc_clean_bitmap != NULL );
+        lfs->gc.used_block_bitmap = lfs->cfg->gc_used_bitmap;
+        lfs->gc.clean_block_bitmap = lfs->cfg->gc_clean_bitmap;
+    }
+    else {
+        // Allocate the bitmap buffers
+        lfs->gc.used_block_bitmap = lfs_malloc(bitmap_size);
+        if (!lfs->gc.used_block_bitmap) {
+            err = LFS_ERR_NOMEM;
+            goto cleanup;
+        }
+        memset(lfs->gc.used_block_bitmap, 0, bitmap_size);
+
+        lfs->gc.clean_block_bitmap = lfs_malloc(bitmap_size);
+        if (!lfs->gc.clean_block_bitmap) {
+            err = LFS_ERR_NOMEM;
+            goto cleanup;
+        }
+        memset(lfs->gc.clean_block_bitmap, 0, bitmap_size);
+    }
+#endif
+
     // check that the size limits are sane
     LFS_ASSERT(lfs->cfg->name_max <= LFS_NAME_MAX);
     lfs->name_max = lfs->cfg->name_max;
@@ -4369,16 +4436,35 @@ static int lfs_deinit(lfs_t *lfs) {
     // free allocated memory
     if (!lfs->cfg->read_buffer) {
         lfs_free(lfs->rcache.buffer);
+        lfs->rcache.buffer = NULL;
     }
 
     if (!lfs->cfg->prog_buffer) {
         lfs_free(lfs->pcache.buffer);
+        lfs->pcache.buffer = NULL;
     }
 
     if (!lfs->cfg->lookahead_buffer) {
         lfs_free(lfs->lookahead.buffer);
+        lfs->lookahead.buffer = NULL;
     }
 
+#ifdef LFS_PROACTIVE_GC
+    lfs->gc.clean_map_initialized = false;
+
+    if (!lfs->cfg->gc_u32_buffer) {
+        lfs_free(lfs->gc.u32_buffer);
+        lfs->gc.u32_buffer = NULL;
+    }
+    if (!lfs->cfg->gc_used_bitmap) {
+        lfs_free(lfs->gc.used_block_bitmap);
+        lfs->gc.used_block_bitmap = NULL;
+    }
+    if (!lfs->cfg->gc_clean_bitmap) {
+        lfs_free(lfs->gc.clean_block_bitmap);
+        lfs->gc.clean_block_bitmap = NULL;
+    }
+#endif
     return 0;
 }
 
@@ -5994,6 +6080,14 @@ int lfs_mount(lfs_t *lfs, const struct lfs_config *cfg) {
     err = lfs_mount_(lfs, cfg);
 
     LFS_TRACE("lfs_mount -> %d", err);
+	#ifdef LFS_PROACTIVE_GC
+		// If the file system was successfully mounted, initialize the garbage collector
+		if ( err == LFS_ERR_OK )
+		{
+			lfs_gc_init_( lfs );
+		}
+	#endif
+
     LFS_UNLOCK(cfg);
     return err;
 }
@@ -6470,6 +6564,267 @@ int lfs_fs_gc(lfs_t *lfs) {
     return err;
 }
 #endif
+
+//////////////////////////////////////////////////////////////////////////
+// LittleFS-GC
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+static int lfs_gc_record_usage_callback_( void *data, lfs_block_t block)
+{
+	lfs_t *lfs = ( data );
+
+	int32_t EBM_Index = block / 8;
+	int32_t EBM_Bit = block % 8;
+	lfs->gc.used_block_bitmap[EBM_Index] |= ( 1 << EBM_Bit);
+	return 0;
+}
+#endif
+#endif
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+// Note: this function depends on lfs->cfg->block_size being a multiple of 4
+static int lfs_is_block_clean_(lfs_t *lfs, lfs_block_t b)
+{
+	size_t n = lfs->cfg->block_size / sizeof(uint32_t);
+	uint32_t offset = 0;
+	uint32_t *pd;
+	
+	while( n )
+	{
+		int err;
+		size_t n_read = min( n, lfs->cfg->gc_buffer_num_words );
+		err = lfs->cfg->read( lfs->cfg, b, (offset * sizeof(uint32_t)), lfs->gc.u32_buffer, (n_read * sizeof(uint32_t)));
+		if ( err != LFS_ERR_OK )
+		{
+			return false;
+		}
+		n -= n_read;
+		offset += n_read;
+		pd = lfs->gc.u32_buffer;
+
+		while( n_read && *(pd++) == 0xFFFFFFFF)
+		{
+			n_read--;
+		}
+		
+		if ( n_read )
+		{
+			// If we left the while() above prematurely, we must have run accross non-0xFF data
+			return false;
+		}
+	}
+	return true;
+}
+#endif
+#endif
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+static void lfs_gc_init_erased_map_(lfs_t * lfs)
+{
+	// Set all to dirty
+	memset( lfs->gc.clean_block_bitmap, 0x00, lfs->cfg->gc_bitmap_size);
+	
+	uint32_t used = 0, clean = 0, dirty = 0;
+	uint32_t num_blocks = lfs->cfg->block_count;
+	for ( uint32_t bn = 0; bn < num_blocks; bn++)
+	{
+		uint32_t i = bn / 8;
+		uint32_t b = bn % 8;
+		if( (lfs->gc.used_block_bitmap[i] >> b) & 1 )
+		{
+			// used
+			used++;
+		}
+		else
+		{
+			// unused, verify
+			if ( lfs_is_block_clean_( lfs, bn) )
+			{
+				// Mark this block as known clean.
+				lfs->gc.clean_block_bitmap[i] |= ( 1 << b);
+				clean++;
+			}
+			else
+			{
+				dirty++;
+			}
+		}
+	}
+	lfs->gc.clean_map_initialized = true;
+	LFS_GC_TRACE("Found %u used, %u clean, %u dirty blocks after initial traversal.", used, clean, dirty);
+}
+#endif
+#endif
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+static int lfs_gc_clean_one_block_(lfs_t * lfs)
+{
+	uint8_t result;
+	uint32_t i = lfs->gc.block / 8;
+	uint32_t b = lfs->gc.block % 8;
+	if ( ( ( lfs->gc.used_block_bitmap[i] >> b) & 1) )
+	{
+		// used... leave it alone
+		// LFS_GC_TRACE("Block 0x%08X is used", lfs->gc.block);
+		result = pdFALSE;
+	}
+	else if( ( lfs->gc.clean_block_bitmap[i] >> b) & 1)
+	{
+		// unused, verified clean
+		// Note: This part should not happen when called from fs_mount()
+		// because at that point all blocks are considered dirty.
+		// LFS_GC_TRACE("Block 0x%08X is unused and verified clean", lfs->gc.block);
+		result = pdTRUE;
+	}
+	else
+	{
+		// unused, verify
+		if ( ! lfs_is_block_clean_( lfs, lfs->gc.block) )
+		{
+			// LFS_GC_TRACE("Block 0x%08X is unused and DIRTY, cleaning...", lfs->gc.block);
+			lfs->cfg->erase(lfs->cfg, lfs->gc.block);
+		}
+		
+		// Mark this block as known clean.
+		lfs->gc.clean_block_bitmap[i] |= ( 1 << b);
+		result = pdTRUE;
+	}
+
+	// Update the count of how many blocks were checked,.
+	if ( lfs->gc.blocks_checked < lfs->cfg->block_count )
+	{
+		lfs->gc.blocks_checked++;
+	}
+
+	// Proceed to the next block
+	if (++lfs->gc.block >= lfs->cfg->block_count)
+	{
+		lfs->gc.block = 0;
+	}
+	
+	return result;
+}
+#endif
+#endif
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+// Returns true if the current block was already marked as clean, was just confirmed clean, or was just cleaned.
+// Returns false if the current block was used and therefor not touched.
+// When done, the function increments lfs->gc.block to get it ready for the next pass.
+// Note: relies on lfs->gc.used_block_bitmap being initialized.
+// Note: relies on and updates lfs->gc.clean_block_bitmap
+void lfs_gc_do_work(lfs_t * lfs)
+{
+	int err = lfs->cfg->lock(lfs->cfg);
+	if (err) {
+		return;
+	}
+	
+	lfs_gc_clean_one_block_( lfs );
+	
+	lfs->cfg->unlock(lfs->cfg);
+	return;
+}
+#endif
+#endif
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+static void lfs_gc_initial_cleanup_(lfs_t * lfs, lfs_size_t free_blocks_target)
+{
+	// The first attempted block allocation will be at a pseudo randomly calculated block. If it happens to be used, LittleFS will check the next, then the next
+	// and so on until it finds an empty block to use. We will proactively ensure that whenever that happens, LittleFS finds a few clean blocks.
+	// We can continue scanning and cleaning the rest of the file system later and at a slower pace.
+	lfs->gc.block = lfs->lookahead.start;
+	// LFS_GC_TRACE("First attempted block allocation will be at 0x%08X.", lfs->gc.block);
+
+	// It is safe to check up to all blocks as we plan on quitting early.
+	// Checking blocks that are used is cheap, so even on a really full file system
+	// going through a bunch of used blocks doesn't even require reading from the flash.
+	uint32_t MaxAttempts = lfs->cfg->block_count;
+
+	while ( free_blocks_target != 0 && MaxAttempts-- )
+	{
+		if ( lfs_gc_clean_one_block_(lfs) )
+		{
+			free_blocks_target--;
+		}
+	}
+}
+#endif
+#endif
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+void lfs_gc_init_( lfs_t *lfs )
+{
+	memset( lfs->gc.used_block_bitmap, 0x00, lfs->cfg->gc_bitmap_size);
+	lfs_fs_traverse_( lfs, lfs_gc_record_usage_callback_, lfs, true);
+	LFS_GC_TRACE("Initial Traversal done.");
+
+	lfs_gc_init_erased_map_(lfs);
+	
+	// Set the checked blocks to zero. When that count reaches lfs->cfg->block_count,
+	// the filesystem will be considered clean.
+	lfs->gc.blocks_checked = 0;
+
+	#if ( LFS_GC_INITIAL_FREE_BLOCK_TARGET > 0 )
+		lfs_gc_initial_cleanup_(lfs, LFS_GC_INITIAL_FREE_BLOCK_TARGET );
+		LFS_GC_TRACE("Initial cleanup done.");
+	#endif
+}
+#endif
+#endif
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+int lfs_gc_update_usage_map( lfs_t *lfs )
+{
+    int err = LFS_LOCK(lfs->cfg);
+    if (err) {
+	    return err;
+    }
+    
+	memset( lfs->gc.used_block_bitmap, 0x00, lfs->cfg->gc_bitmap_size);
+	err = lfs_fs_traverse_( lfs, lfs_gc_record_usage_callback_, lfs, true);
+
+    LFS_UNLOCK(lfs->cfg);
+    return err;
+}
+#endif
+#endif
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+int lfs_gc_is_fs_clean( lfs_t * lfs )
+{
+	return ( lfs->gc.blocks_checked >= lfs->cfg->block_count );
+}
+#endif
+#endif
+
+#ifndef LFS_READONLY
+#ifdef LFS_PROACTIVE_GC
+static void lfs_gc_mark_block_as_used_( lfs_t * lfs, lfs_block_t block )
+{
+	int32_t EBM_Index = block / 8;
+	int32_t EBM_Bit = block % 8;
+	lfs->gc.used_block_bitmap[EBM_Index] |= ( 1 << EBM_Bit);
+	lfs->gc.clean_block_bitmap[EBM_Index] &= ~( 1 << EBM_Bit);
+	// The line below causes the garbage collector to restart its operation.
+	// It will go back to sleep once it has re-checked all blocks.
+	lfs->gc.blocks_checked = 0;
+}
+#endif
+#endif
+
+// END - LittleFS-GC
+//////////////////////////////////////////////////////////////////////////
 
 #ifndef LFS_READONLY
 int lfs_fs_grow(lfs_t *lfs, lfs_size_t block_count) {
