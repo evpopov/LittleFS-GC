@@ -44,8 +44,8 @@ First, add the following to your `lfs_config.h` file:
     #endif
 #endif
 ```
-`LFS_PROACTIVE_GC` simply enables LittleFS-GC 
-`LFS_GC_INITIAL_FREE_BLOCK_TARGET` specifies how many blocks will be cleaned up proactively before lfs_mount() completes. This is an optional feature. Cleaning a few blocks during power-up can improve the consistency of how long it takes to write to a file. This proactive cleanup is not required as the background garbage collection will eventually clean those same blocks anyway.
+- `LFS_PROACTIVE_GC` simply enables LittleFS-GC
+- `LFS_GC_INITIAL_FREE_BLOCK_TARGET` specifies how many blocks will be cleaned up proactively before lfs_mount() completes. This is an optional feature. Cleaning a few blocks during power-up can improve the consistency of how long it takes to write to a file. This proactive cleanup is not required as the background garbage collection will eventually clean those same blocks anyway.
 
 You also need to create a background task that calls the garbage collector periodically. This is usually a low-priority task.
 Here's some sample code based on FreeRTOS:
